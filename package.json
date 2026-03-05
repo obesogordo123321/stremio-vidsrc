@@ -1,0 +1,13 @@
+{
+  "name": "stremio-vidsrc-addon",
+  "version": "1.1.0",
+  "description": "Stremio addon for vidsrc.to",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "stremio-addon-sdk": "^1.6.8"
+  }
+}
