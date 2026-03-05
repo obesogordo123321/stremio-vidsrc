@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const manifest = {
   id: 'community.vidsrc',
-  version: '1.3.0',
+  version: '1.4.0',
   name: 'Vidsrc.to',
   description: 'Watch movies and TV shows from vidsrc.to',
   resources: ['stream'],
@@ -42,11 +42,7 @@ async function extractVideoUrl(embedUrl, depth = 0) {
     const response = await fetchWithHeaders(embedUrl, embedUrl);
     const html = response.data;
 
-    // Log a snippet to see what we're dealing with
-    console.log('HTML snippet (first 2000 chars):');
-    console.log(html.substring(0, 2000));
-
-    // 1. Check for iframe and follow it
+    // Check for iframe
     const iframeMatch = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
     if (iframeMatch) {
       let iframeSrc = iframeMatch[1];
@@ -57,114 +53,57 @@ async function extractVideoUrl(embedUrl, depth = 0) {
       return await extractVideoUrl(iframeSrc, depth + 1);
     }
 
-    // 2. Look for common patterns in script tags
-    const scriptPatterns = [
-      // "file":"https://..."
+    // If we're on cloudnestra.com with /rcp/ path, try API
+    if (embedUrl.includes('cloudnestra.com/rcp/')) {
+      const tokenMatch = embedUrl.match(/\/rcp\/([^\/]+)/);
+      if (tokenMatch) {
+        const token = tokenMatch[1];
+        console.log(`Found cloudnestra token: ${token}`);
+
+        // Try API endpoint (common pattern)
+        const apiUrl = `https://cloudnestra.com/api/source/${token}`;
+        try {
+          console.log(`Trying API: ${apiUrl}`);
+          const apiResponse = await axios.post(apiUrl, {}, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0',
+              'Referer': embedUrl,
+              'X-Requested-With': 'XMLHttpRequest'
+            },
+            timeout: 10000
+          });
+
+          if (apiResponse.data && apiResponse.data.sources) {
+            const sources = apiResponse.data.sources;
+            if (Array.isArray(sources) && sources.length > 0) {
+              // Pick the first source (could sort by quality)
+              const videoUrl = sources[0].file;
+              console.log(`Found video URL from API: ${videoUrl}`);
+              return videoUrl;
+            }
+          }
+        } catch (apiError) {
+          console.log(`API request failed: ${apiError.message}`);
+        }
+      }
+    }
+
+    // Fallback to previous patterns (just in case)
+    const patterns = [
       /"file"\s*:\s*"(https?:[^"]+\.(?:m3u8|mp4)[^"]*)"/,
-      // file:"https://..."
       /file\s*:\s*"(https?:[^"]+\.(?:m3u8|mp4)[^"]*)"/,
-      // "file":"https:\/\/..." (escaped)
       /"file"\s*:\s*"(https?:\\\/\\\/[^"]+\.(?:m3u8|mp4)[^"]*)"/,
-      // "file":"\/\/..." (protocol-relative)
-      /"file"\s*:\s*"(\\\/\\\/[^"]+\.(?:m3u8|mp4)[^"]*)"/,
-      // "src":"https://..."
       /"src"\s*:\s*"(https?:[^"]+\.(?:m3u8|mp4)[^"]*)"/,
-      // "playlist_url":"https://..."
-      /"playlist_url"\s*:\s*"(https?:[^"]+\.m3u8[^"]*)"/
+      /"(https?:[^"]+\.m3u8[^"]*)"/
     ];
 
-    for (const pattern of scriptPatterns) {
+    for (const pattern of patterns) {
       const match = html.match(pattern);
       if (match) {
         let url = match[1].replace(/\\\//g, '/');
         if (url.startsWith('//')) url = 'https:' + url;
         console.log(`Found URL via pattern: ${url}`);
         return url;
-      }
-    }
-
-    // 3. Look for sources array
-    const sourcesMatch = html.match(/sources\s*:\s*(\[[^\]]+\])/);
-    if (sourcesMatch) {
-      try {
-        const sourcesJson = sourcesMatch[1].replace(/'/g, '"');
-        const sources = JSON.parse(sourcesJson);
-        if (Array.isArray(sources) && sources.length > 0) {
-          for (const source of sources) {
-            if (source.file) {
-              let url = source.file.replace(/\\\//g, '/');
-              if (url.startsWith('//')) url = 'https:' + url;
-              console.log(`Found URL in sources array: ${url}`);
-              return url;
-            }
-          }
-        }
-      } catch (e) {
-        console.log('Failed to parse sources array:', e.message);
-      }
-    }
-
-    // 4. Look for video element src
-    const videoSrcMatch = html.match(/<video[^>]+src=["']([^"']+)["']/i);
-    if (videoSrcMatch) {
-      let url = videoSrcMatch[1];
-      if (url.startsWith('//')) url = 'https:' + url;
-      else if (url.startsWith('/')) url = new URL(url, embedUrl).href;
-      console.log(`Found video src: ${url}`);
-      return url;
-    }
-
-    // 5. Look for any .m3u8 URL
-    const m3u8Match = html.match(/"(https?:[^"]+\.m3u8[^"]*)"/);
-    if (m3u8Match) {
-      let url = m3u8Match[1].replace(/\\\//g, '/');
-      console.log(`Found .m3u8 URL: ${url}`);
-      return url;
-    }
-
-    // 6. Look for player configuration object
-    const configMatch = html.match(/playerConfig\s*=\s*({.+?});/);
-    if (configMatch) {
-      try {
-        const config = JSON.parse(configMatch[1]);
-        // Explore common keys: file, sources, playlist, etc.
-        if (config.file) {
-          let url = config.file.replace(/\\\//g, '/');
-          if (url.startsWith('//')) url = 'https:' + url;
-          console.log(`Found URL in playerConfig.file: ${url}`);
-          return url;
-        }
-        if (config.sources && Array.isArray(config.sources)) {
-          for (const source of config.sources) {
-            if (source.file) {
-              let url = source.file.replace(/\\\//g, '/');
-              if (url.startsWith('//')) url = 'https:' + url;
-              console.log(`Found URL in playerConfig.sources: ${url}`);
-              return url;
-            }
-          }
-        }
-      } catch (e) {
-        console.log('Failed to parse playerConfig:', e.message);
-      }
-    }
-
-    // 7. If nothing found, maybe it's a JSON API response? Check if response is JSON
-    const contentType = response.headers['content-type'] || '';
-    if (contentType.includes('application/json')) {
-      try {
-        const json = response.data;
-        console.log('Response appears to be JSON, attempting to extract URL');
-        // Try to find a field containing a video URL
-        const jsonStr = JSON.stringify(json);
-        const urlMatch = jsonStr.match(/"https?:[^"]+\.(?:m3u8|mp4)[^"]*"/);
-        if (urlMatch) {
-          let url = urlMatch[0].slice(1, -1).replace(/\\\//g, '/');
-          console.log(`Found URL in JSON: ${url}`);
-          return url;
-        }
-      } catch (e) {
-        console.log('JSON parsing failed:', e.message);
       }
     }
 
@@ -180,7 +119,6 @@ builder.defineStreamHandler(async (args) => {
   const { type, id } = args;
   console.log(`Stream request: type=${type}, id=${id}, args=${JSON.stringify(args)}`);
 
-  // Determine if id is IMDb (starts with 'tt') or TMDB (numeric)
   const isImdb = id.startsWith('tt');
   const lookupId = isImdb ? id : id;
 
