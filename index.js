@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const manifest = {
   id: 'community.vidsrc',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'Vidsrc.to',
   description: 'Watch movies and TV shows from vidsrc.to',
   resources: ['stream'],
@@ -14,87 +14,138 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// Helper to extract video URL from the embed page HTML
-async function extractVideoUrl(embedUrl) {
-  try {
-    // Fetch the embed page with a browser-like User-Agent
-    const response = await axios.get(embedUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://vidsrc.to/'
-      }
-    });
+// Helper to fetch URL with browser headers
+async function fetchWithHeaders(url) {
+  return axios.get(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': 'https://vidsrc.to/',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1'
+    },
+    timeout: 10000
+  });
+}
 
+// Recursively extract video URL from embed page, following iframes
+async function extractVideoUrl(embedUrl, depth = 0) {
+  if (depth > 3) return null; // Prevent infinite loops
+  try {
+    console.log(`Fetching embed URL: ${embedUrl}`);
+    const response = await fetchWithHeaders(embedUrl);
     const html = response.data;
 
-    // Common patterns for video URLs in vidsrc.to pages
-    const patterns = [
-      // "file":"https://..." (JSON inside script)
+    // 1. Check for iframe and follow it
+    const iframeMatch = html.match(/<iframe[^>]+src="([^"]+)"/i);
+    if (iframeMatch) {
+      let iframeSrc = iframeMatch[1];
+      if (iframeSrc.startsWith('//')) iframeSrc = 'https:' + iframeSrc;
+      else if (iframeSrc.startsWith('/')) iframeSrc = new URL(iframeSrc, embedUrl).href;
+      else if (!iframeSrc.startsWith('http')) iframeSrc = new URL(iframeSrc, embedUrl).href;
+      console.log(`Following iframe: ${iframeSrc}`);
+      return await extractVideoUrl(iframeSrc, depth + 1);
+    }
+
+    // 2. Look for video URL in script tags
+    const scriptPatterns = [
+      // "file":"https://..."
       /"file"\s*:\s*"(https?:[^"]+\.(?:m3u8|mp4)[^"]*)"/,
       // file:"https://..."
       /file\s*:\s*"(https?:[^"]+\.(?:m3u8|mp4)[^"]*)"/,
       // "file":"https:\/\/..." (escaped slashes)
       /"file"\s*:\s*"(https?:\\\/\\\/[^"]+\.(?:m3u8|mp4)[^"]*)"/,
-      // direct .m3u8 URL
-      /"(https?:[^"]+\.m3u8[^"]*)"/,
-      // <video src="...">
-      /<video[^>]+src="([^"]+)"/
+      // "file":"\/\/..." (protocol-relative)
+      /"file"\s*:\s*"(\\\/\\\/[^"]+\.(?:m3u8|mp4)[^"]*)"/,
+      // "src":"https://..."
+      /"src"\s*:\s*"(https?:[^"]+\.(?:m3u8|mp4)[^"]*)"/,
+      // "playlist_url":"https://..."
+      /"playlist_url"\s*:\s*"(https?:[^"]+\.m3u8[^"]*)"/
     ];
 
-    for (const pattern of patterns) {
+    for (const pattern of scriptPatterns) {
       const match = html.match(pattern);
       if (match) {
-        // Unescape slashes if needed
         let url = match[1].replace(/\\\//g, '/');
-        // If relative, prepend embed URL base
         if (url.startsWith('//')) url = 'https:' + url;
-        else if (url.startsWith('/')) url = new URL(url, embedUrl).href;
+        console.log(`Found video URL: ${url}`);
         return url;
       }
     }
 
-    // If no direct match, look for a "sources" array in JSON
+    // 3. Look for sources array (common in vidsrc)
     const sourcesMatch = html.match(/sources\s*:\s*(\[[^\]]+\])/);
     if (sourcesMatch) {
       try {
-        const sources = JSON.parse(sourcesMatch[1].replace(/'/g, '"'));
+        // Replace single quotes with double quotes for valid JSON
+        const sourcesJson = sourcesMatch[1].replace(/'/g, '"');
+        const sources = JSON.parse(sourcesJson);
         if (Array.isArray(sources) && sources.length > 0) {
-          // Pick the first source (or you could sort by quality)
-          const firstSource = sources[0];
-          if (firstSource.file) return firstSource.file.replace(/\\\//g, '/');
+          // Find the first source with a file (could also pick highest quality)
+          for (const source of sources) {
+            if (source.file) {
+              let url = source.file.replace(/\\\//g, '/');
+              if (url.startsWith('//')) url = 'https:' + url;
+              console.log(`Found source from sources array: ${url}`);
+              return url;
+            }
+          }
         }
       } catch (e) {
-        // ignore parse error
+        console.log('Failed to parse sources array:', e.message);
       }
     }
 
+    // 4. Look for video element with src
+    const videoSrcMatch = html.match(/<video[^>]+src="([^"]+)"/i);
+    if (videoSrcMatch) {
+      let url = videoSrcMatch[1];
+      if (url.startsWith('//')) url = 'https:' + url;
+      else if (url.startsWith('/')) url = new URL(url, embedUrl).href;
+      console.log(`Found video src: ${url}`);
+      return url;
+    }
+
+    // 5. Look for any .m3u8 URL in the whole HTML
+    const m3u8Match = html.match(/"(https?:[^"]+\.m3u8[^"]*)"/);
+    if (m3u8Match) {
+      let url = m3u8Match[1].replace(/\\\//g, '/');
+      console.log(`Found .m3u8 URL: ${url}`);
+      return url;
+    }
+
+    console.log('No video URL found in this page.');
     return null;
   } catch (error) {
-    console.error('Extraction error:', error.message);
+    console.error(`Error fetching ${embedUrl}:`, error.message);
     return null;
   }
 }
 
 builder.defineStreamHandler(async (args) => {
   const { type, id } = args;
-  let embedUrl;
+  console.log(`Stream request: type=${type}, id=${id}, args=${JSON.stringify(args)}`);
 
   // Determine if id is IMDb (starts with 'tt') or TMDB (numeric)
   const isImdb = id.startsWith('tt');
   const lookupId = isImdb ? id : id; // TMDB IDs are passed as-is
 
+  let embedUrl;
   if (type === 'movie') {
     embedUrl = `https://vidsrc.to/embed/movie/${lookupId}`;
   } else if (type === 'series') {
     const { season, episode } = args;
-    if (season && episode) {
-      embedUrl = `https://vidsrc.to/embed/tv/${lookupId}/${season}/${episode}`;
-    } else {
+    if (!season || !episode) {
+      console.log('Missing season/episode for series');
       return { streams: [] };
     }
+    embedUrl = `https://vidsrc.to/embed/tv/${lookupId}/${season}/${episode}`;
   } else {
     return { streams: [] };
   }
+
+  console.log(`Constructed embed URL: ${embedUrl}`);
 
   try {
     const videoUrl = await extractVideoUrl(embedUrl);
@@ -103,12 +154,13 @@ builder.defineStreamHandler(async (args) => {
         streams: [{
           url: videoUrl,
           title: 'Vidsrc.to',
-          // Hint that this is a direct stream (not a webpage)
-          behaviorHints: { notWebReady: false }
+          behaviorHints: { notWebReady: false } // direct stream
         }]
       };
+    } else {
+      console.log('No video stream found');
+      return { streams: [] };
     }
-    return { streams: [] };
   } catch (error) {
     console.error('Stream handler error:', error);
     return { streams: [] };
